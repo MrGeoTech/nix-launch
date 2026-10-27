@@ -134,8 +134,37 @@ programs.launch = {
   What it can't do: xdg-desktop-portals (so no portal file chooser or
   screen capture inside the sandbox) and FUSE (AppImages). The app's own
   file dialog only sees what its profile shares.
-- **`microvm`**: planned. Accepted in config, but such apps refuse to start
-  until it's implemented.
+- **`microvm`**: a throwaway KVM virtual machine with its own kernel, for
+  things you trust least. See below.
+
+### The microvm backend
+
+Every run boots the same small image (the stock kernel plus a ~1 MB
+initramfs, `nix/microvm-guest.nix`) and configures it for that one app:
+
+- Your `/nix/store` is shared in read-only, so whatever the host fetched
+  runs inside. Each shared folder from the profile (home, `paths`, cwd,
+  opened files) gets its own `virtiofsd`, read-only where the profile says.
+  Nothing else on the host is visible.
+- `network = "full"` is QEMU's user-mode network: outbound connections
+  and DNS, with nothing reachable from outside. `"none"` gives the VM no
+  network device at all.
+- The app runs as your UID on a terminal with your window size, or, from
+  a pipe or script, with exact stdin/stdout/stderr bytes. Its exit status
+  becomes `launch`'s, so it works in scripts like a local command.
+- About 1.5–2 seconds per run. Nothing persists unless the profile shares
+  it (`home = "private"` keeps a home between runs).
+
+```nix
+programs.launch.apps.sketchy-tool = { backend = "microvm"; profile = "isolated"; };
+programs.launch.backends.microvm = { memory = 4096; vcpus = 4; };  # defaults: 2048, 2
+```
+
+Current limits: command-line apps only (no Wayland, audio or GPU yet, so
+GUI profiles get a warning on the confirm screen), x86_64-linux only, and
+needs read/write access to `/dev/kvm`. An opened file is shared by sharing
+its directory (virtiofs shares directories). `LAUNCH_VM_DEBUG=1` shows the
+guest's boot log and keeps the run's temp directory.
 
 ### Options (`programs.launch.*`)
 
@@ -191,14 +220,16 @@ launch refresh [--force]
 - **Running** is the same for every path in: `nix build` the package
   (with a "Fetching…" notification when there's no terminal to show
   progress), then exec it directly or inside the backend with the
-  resolved profile.
+  resolved profile. For microvm that means booting the guest with this
+  run's shares and command (`src/vm-init.sh` is its whole init).
 - **rofi** talks to the same script through the
   [script mode protocol](https://davatorium.github.io/rofi/current/rofi-script.5/);
   the confirm screen is a second page using rofi's message box.
 
 Requires `nix` with flakes enabled and unprivileged user namespaces (the
 default on NixOS) for bwrap. The package brings its own `nix-locate`,
-bubblewrap, fzf and `notify-send`.
+bubblewrap, fzf and `notify-send`; the module adds QEMU, virtiofsd and the
+guest image only when something uses the microvm backend.
 
 ## License
 
