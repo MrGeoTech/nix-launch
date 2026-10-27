@@ -9,13 +9,16 @@ Everything you can start lives in one ranked list:
   4. nixpkgs apps                  (ship a .desktop file, not installed)
   5. everything else in nixpkgs    (ships a binary, not installed)
 
-Anything from 4/5 is never installed: it runs through `nix shell`, and only
-after a confirmation screen that shows what the package actually is.
+Nothing is ever installed: packages are fetched into the store on first use
+and run in a sandbox (a named backend + access profile, bwrap by default).
+Anything from 4/5 also needs a yes on a screen showing what it actually is.
 
 Front ends, same logic underneath:
   launch                  fuzzy picker in the terminal (fzf + preview)
   launch run CMD [ARGS]   run CMD, offering nixpkgs packages if it's missing
                           (this is what the shells' command-not-found calls)
+  launch exec APP [ARGS]  run a pinned app (programs.launch.apps) in its
+                          sandbox, no prompt (what the per-app commands call)
   launch info NAME        show the card for an app, command or package
   launch search TERM      print matching entries
   launch refresh          rebuild the nixpkgs catalog
@@ -311,17 +314,36 @@ def load_catalog(background_refresh=True):
 # What's on this machine
 # --------------------------------------------------------------------------
 
-def pinned():
-    """On-demand apps: wrappers that ship share/launch/pinned/<name>.json
-    ({"name", "attr", "bin", "description"}), e.g. from mkOnDemandApp."""
-    out, seen = [], set()
+def pinned(cfg=None):
+    """On-demand apps: `apps` from the home-manager module, plus wrappers that
+    ship share/launch/pinned/<name>.json ({"name", "attr", "bin",
+    "description"}), e.g. from mkOnDemandApp, which run unsandboxed."""
+    cfg = cfg or load_config()
+    out = [dict(app, name=name) for name, app in sorted(cfg["apps"].items())]
+    seen = {p["name"] for p in out}
     for d in data_dirs():
         for f in sorted(glob.glob(f"{d}/launch/pinned/*.json")):
             p = read_json(f, None)
             if p and p.get("name") not in seen:
                 seen.add(p["name"])
-                out.append(p)
+                out.append(dict(p, backend="none"))
     return out
+
+
+def pinned_app(name, cat, cfg):
+    """(package dict, sandbox) for a pinned app, or None."""
+    pin = next((p for p in pinned(cfg) if p["name"] == name), None)
+    if pin is None:
+        return None
+    p = dict(cat.get(pin["attr"], {}), attr=pin["attr"], bin=pin["bin"])
+    p.setdefault("description", pin.get("description", ""))
+    if "free" in pin:
+        p["free"] = pin["free"]
+    if not p.get("bins"):
+        p["gui"] = bool(p.get("icon"))  # no file info (unfree, not on Hydra): guess
+    sb = sandbox_for(cfg, pin.get("backend", "default"), pin.get("profile", "default"),
+                     pin.get("access"), home_name=name)
+    return p, sb
 
 
 def parse_desktop(path):
@@ -543,7 +565,7 @@ def in_store(p):
     return bool(glob.glob(f"/nix/store/*-{glob.escape(p['pname'])}-{glob.escape(p['version'])}"))
 
 
-def card(p):
+def card(p, sb=None):
     """Structured facts about a package, shared by both front ends."""
     bins = p.get("bins", [])
     others = [b for b in bins if b != p.get("bin")]
@@ -559,7 +581,11 @@ def card(p):
     facts.append(("runs", run))
     facts.append(("status", "already in the nix store, starts right away" if in_store(p)
                   else "not downloaded yet, fetched into the nix store on first run"))
+    if sb:
+        facts.append(("sandbox", describe_sandbox(sb)))
     warn = []
+    if sb and sb["type"] == "microvm":
+        warn.append("the microvm backend isn't implemented yet, this won't start")
     if p.get("broken"):
         warn.append("marked broken in nixpkgs, it may not build")
     if not p.get("free", True):
@@ -569,21 +595,247 @@ def card(p):
             "facts": facts, "warn": warn}
 
 
-def nix_shell_argv(p, command=None):
-    argv = ["nix", "shell"]
-    if not p.get("free", True):
-        argv.append("--impure")
-    argv.append(f"{NIXPKGS}#{p['attr']}")
-    if command:
-        argv += ["--command", *command]
-    return argv
-
-
 def nix_env(p):
     env = dict(os.environ)
     if not p.get("free", True):
         env["NIXPKGS_ALLOW_UNFREE"] = "1"
     return env
+
+
+# --------------------------------------------------------------------------
+# Sandboxes: named backends + access profiles (presets.json, overlaid by
+# the home-manager module's ~/.config/launch/config.json)
+# --------------------------------------------------------------------------
+
+PRESETS = os.environ.get("LAUNCH_PRESETS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+CONFIG = os.environ.get("LAUNCH_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"), "launch", "config.json")
+HOMES_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"), "launch", "homes")
+
+# Everything a profile leaves unset is off.
+ACCESS_BASE = {"network": "none", "home": "none", "args": "none", "cwd": "none",
+               "wayland": False, "x11": False, "audio": False, "gpu": False, "dbus": False,
+               "theming": False, "paths": {}, "env": {}, "devices": []}
+
+# Read-only bits of $HOME that make GUI apps look like the rest of the desktop.
+THEMING = [".nix-profile", ".gtkrc-2.0", ".config/gtk-2.0", ".config/gtk-3.0", ".config/gtk-4.0",
+           ".config/fontconfig", ".local/share/fonts", ".fonts", ".icons", ".local/share/icons",
+           ".config/qt5ct", ".config/qt6ct", ".config/Kvantum", ".config/kdeglobals", ".config/xsettingsd"]
+
+
+def load_config():
+    pre, user = read_json(PRESETS, {}), read_json(CONFIG, {})
+    cfg = {k: {**pre.get(k, {}), **user.get(k, {})} for k in ("backends", "profiles")}
+    cfg["apps"] = user.get("apps", {})
+    return cfg
+
+
+def merge_access(into, layer):
+    """Lay `layer` over `into`. Unset (missing/None) fields don't override;
+    paths/env merge, devices accumulate."""
+    for k, v in layer.items():
+        if k == "inherits" or v is None:
+            continue
+        if k in ("paths", "env"):
+            into[k] = {**into.get(k, {}), **v}
+        elif k == "devices":
+            into[k] = into.get(k, []) + [d for d in v if d not in into.get(k, [])]
+        else:
+            into[k] = v
+    return into
+
+
+def profile_layers(cfg, name, seen=()):
+    """A profile with its `inherits` applied, still sparse (only set fields)."""
+    if name in seen:
+        raise ValueError(f"profile inherits itself: {' -> '.join((*seen, name))}")
+    prof = cfg["profiles"].get(name)
+    if prof is None:
+        raise ValueError(f"no profile named {name!r}")
+    acc = {}
+    for parent in prof.get("inherits", []):
+        merge_access(acc, profile_layers(cfg, parent, (*seen, name)))
+    return merge_access(acc, prof)
+
+
+def sandbox_for(cfg, backend="default", profile="default", extra=None, home_name="default"):
+    b = cfg["backends"].get(backend)
+    if b is None:
+        raise ValueError(f"no backend named {backend!r}")
+    sparse = merge_access(profile_layers(cfg, profile), extra or {})
+    return {"backend": backend, "type": b["type"], "cfg": b, "profile": profile,
+            "access": merge_access(json.loads(json.dumps(ACCESS_BASE)), sparse),
+            "home_name": re.sub(r"[^A-Za-z0-9._-]", "_", home_name)}
+
+
+def adhoc_sandbox(cfg, attr):
+    """Uninstalled packages started from the list or the shell hook."""
+    return sandbox_for(cfg, home_name=f"nixpkgs-{attr}")
+
+
+def describe_sandbox(sb):
+    """One line: where it runs and what it can reach."""
+    if sb["type"] == "none":
+        return f"{sb['backend']}: runs directly, no isolation"
+    a, can = sb["access"], []
+    if a["network"] == "full":
+        can.append("network")
+    can += [n for n, k in (("wayland", "wayland"), ("x11", "x11"), ("audio", "audio"), ("gpu", "gpu"),
+                           ("session bus", "dbus")) if a[k]]
+    can.append({"none": "empty home", "private": "own home", "full": "YOUR HOME"}[a["home"]])
+    if a["args"] != "none":
+        can.append(f"opened files ({a['args']})")
+    if a["cwd"] != "none":
+        can.append(f"current dir ({a['cwd']})")
+    if a["paths"]:
+        can.append(f"{len(a['paths'])} extra path(s)")
+    if a["devices"]:
+        can.append(f"{len(a['devices'])} device(s)")
+    where = sb["backend"] if sb["backend"] == sb["type"] else f"{sb['backend']} ({sb['type']})"
+    return f"{where}, {sb['profile']} profile: {', '.join(can)}"
+
+
+def bwrap_argv(sb, exe, argv0, args):
+    """bubblewrap command line for running exe with access sb['access']."""
+    a = sb["access"]
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    cwd = os.getcwd()
+    out = ["bwrap", "--die-with-parent", "--unshare-all", "--hostname", "launch"]
+    if a["network"] == "full":
+        out.append("--share-net")
+    if not sys.stdin.isatty():
+        out.append("--new-session")  # no controlling terminal to protect otherwise
+
+    def bind(src, dst=None, mode="ro"):
+        if os.path.lexists(src):
+            out.extend([{"ro": "--ro-bind", "rw": "--bind", "dev": "--dev-bind"}[mode], src, dst or src])
+
+    out += ["--ro-bind", "/nix/store", "/nix/store", "--ro-bind", "/etc", "/etc",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run", "--dir", xdg]
+    for d in ("/bin", "/usr"):
+        bind(d)
+    # NixOS keeps system paths as symlinks into the store under /run.
+    for link in ("/run/current-system", "/run/opengl-driver", "/run/opengl-driver-32"):
+        if os.path.islink(link):
+            out += ["--symlink", os.readlink(link), link]
+    if a["network"] == "full":
+        bind("/run/systemd/resolve")  # /etc/resolv.conf often points here
+        bind("/run/nscd")             # NixOS resolves names through nscd
+
+    if a["home"] == "full":
+        bind(HOME, mode="rw")
+    elif a["home"] == "private":
+        home = os.path.join(HOMES_DIR, sb["home_name"])
+        os.makedirs(home, exist_ok=True)
+        out += ["--bind", home, HOME]
+    else:
+        out += ["--tmpfs", HOME]
+    if a["theming"] and a["home"] != "full":
+        for rel in THEMING:
+            src = os.path.join(HOME, rel)
+            if os.path.exists(src):
+                out += ["--ro-bind", os.path.realpath(src), src]
+
+    if a["wayland"]:
+        disp = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        bind(disp if disp.startswith("/") else f"{xdg}/{disp}", mode="rw")
+    if a["x11"]:
+        bind("/tmp/.X11-unix", mode="rw")
+        if os.environ.get("XAUTHORITY"):
+            bind(os.environ["XAUTHORITY"])
+    if a["audio"]:
+        bind(f"{xdg}/pipewire-0", mode="rw")
+        bind(f"{xdg}/pulse/native", mode="rw")
+    if a["dbus"]:
+        bind(f"{xdg}/bus", mode="rw")
+    else:
+        out += ["--unsetenv", "DBUS_SESSION_BUS_ADDRESS"]
+    if a["gpu"]:
+        bind("/dev/dri", mode="dev")
+        bind("/sys")
+        for n in glob.glob("/dev/nvidia*"):
+            bind(n, mode="dev")
+    for dev in a["devices"]:
+        bind(dev, mode="dev")
+
+    for path, mode in a["paths"].items():
+        path = os.path.expanduser(path)
+        bind(path, mode=mode)
+    shared_cwd = a["cwd"] != "none" and cwd not in (HOME, "/")
+    if shared_cwd:
+        bind(cwd, mode=a["cwd"])
+    if a["args"] != "none":
+        for arg in args:
+            path = os.path.abspath(arg)
+            if arg.startswith("-") or not os.path.exists(path):
+                continue
+            if a["args"] == "ro":
+                bind(path)
+            else:
+                # The file's directory, so save-via-rename works -- but never
+                # all of $HOME or / just because a file sits there.
+                d = os.path.dirname(path) if os.path.isfile(path) else path
+                bind(d if d not in (HOME, "/") else path, mode="rw")
+
+    visible = shared_cwd or (a["home"] == "full" and cwd.startswith(HOME))
+    out += ["--chdir", cwd if visible else HOME]
+    for k, v in a["env"].items():
+        out += ["--setenv", k, v]
+    out += sb["cfg"].get("extraArgs", [])
+    return out + ["--argv0", argv0, "--", exe, *args]
+
+
+def execute(p, binary, args, sb, shell=False):
+    """Fetch p (if needed) and exec `binary args` -- or $SHELL with the
+    package on PATH -- inside sandbox sb. Never returns on success.
+    With a terminal, nix's progress shows there; without one, failures
+    come back as notifications."""
+    tty = sys.stdin.isatty()
+    name = p.get("pname", p["attr"])
+
+    def fail(msg):
+        if tty:
+            print(f"launch: {msg}", file=sys.stderr)
+        else:
+            notify(f"Couldn't start {name}", msg, "dialog-error", "critical")
+        return 1
+
+    if sb["type"] == "microvm":
+        return fail("the microvm backend isn't implemented yet")
+    if sb["type"] == "bwrap" and not shutil.which("bwrap"):
+        return fail("bwrap (bubblewrap) isn't on PATH")
+
+    if not tty and not in_store(p):
+        notify(f"Fetching {name}", f"{NIXPKGS}#{p['attr']}, this can take a minute",
+               p.get("icon") or "system-software-install")
+    build = ["nix", "build", "--no-link", "--print-out-paths"] + (["--impure"] if not p.get("free", True) else [])
+    r = subprocess.run(build + [f"{NIXPKGS}#{p['attr']}"], env=nix_env(p), stdout=subprocess.PIPE,
+                       stderr=None if tty else subprocess.PIPE, text=True, check=False)
+    if r.returncode != 0:
+        return fail((r.stderr or "").strip()[-400:] or f"building {NIXPKGS}#{p['attr']} failed")
+
+    outs = r.stdout.split()
+    bindirs = [f"{o}/bin" for o in outs if os.path.isdir(f"{o}/bin")]
+    env = dict(os.environ, PATH=":".join(bindirs + [os.environ.get("PATH", "")]))
+    if shell:
+        exe = os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
+        argv0, args = os.path.basename(exe), []
+    else:
+        exe = next((f"{d}/{binary}" for d in bindirs if os.access(f"{d}/{binary}", os.X_OK)), None)
+        if exe is None:
+            return fail(f"{NIXPKGS}#{p['attr']} has no bin/{binary}")
+        argv0 = binary
+
+    if sb["type"] == "none":
+        argv, exe_path = [argv0, *args], exe
+    else:
+        argv = bwrap_argv(sb, exe, argv0, args)
+        exe_path = shutil.which("bwrap")
+    # TUI apps (bottom, btop, ...) ship a Terminal=true desktop file.
+    if not tty and not shell and any((parse_desktop(f) or {}).get("Terminal") == "true"
+                                     for o in outs for f in glob.glob(f"{o}/share/applications/*.desktop")):
+        os.execvpe(TERMINAL, [TERMINAL, "-e", exe_path, *argv[1:]], env)
+    os.execve(exe_path, argv, env)
 
 
 # --------------------------------------------------------------------------
@@ -638,7 +890,8 @@ def confirm_and_run(cands, cmd, args):
     """Show what would run and ask first. Nothing is fetched before a yes."""
     if len(cands) == 1:
         p = cands[0]
-        print_card(card(p), out=sys.stderr)
+        sb = adhoc_sandbox(load_config(), p["attr"])
+        print_card(card(p, sb), out=sys.stderr)
         b = cmd if cmd in p.get("bins", ()) or not p.get("bins") else p["bin"]
         a = ask(f"\n  {C['mauve']}Run {C['bold']}{b}{C['reset']}{C['mauve']} from {NIXPKGS}#{p['attr']}?{C['reset']} [y/N] ")
         if a.lower() not in ("y", "yes"):
@@ -658,7 +911,7 @@ def confirm_and_run(cands, cmd, args):
         print(file=sys.stderr)
         return confirm_and_run([cands[int(a) - 1]], cmd, args)
     record(f"n:{p['attr']}")
-    os.execvpe("nix", nix_shell_argv(p, [b, *args]), nix_env(p))
+    return execute(p, b, args, sb)
 
 
 def cmd_run(argv):
@@ -713,15 +966,13 @@ def cmd_info(argv):
             print(f"  {C['dim']}{k:<9}{C['reset']} {C['text']}{v}{C['reset']}")
         return 0
     if kind == "p":
-        pin = next(p for p in pinned() if p["name"] == ident)
-        p = cat.get(pin["attr"]) or {"attr": pin["attr"], "description": pin.get("description"), "bin": pin["bin"]}
-        p = dict(p, bin=pin["bin"])
-        info = card(p)
+        p, sb = pinned_app(ident, cat, load_config())
+        info = card(p, sb)
         info["facts"].insert(0, ("pinned", f"`{ident}` is a pinned on-demand app, no prompt"))
         print_card(info, width)
         return 0
     p = cat.get(ident) or live_package(ident)
-    info = card(p)
+    info = card(p, adhoc_sandbox(load_config(), ident) if kind == "n" else None)
     if kind == "t":
         info["facts"][-1] = ("status", f"installed: {shutil.which(p['bin']) or p['bin']}")
     print_card(info, width)
@@ -762,12 +1013,18 @@ def open_entry(key, cat, frontend):
         detach(shlex.split(ident))
         return 0
     if kind == "p":
-        pin = next(p for p in pinned() if p["name"] == ident)
-        p = dict(cat.get(pin["attr"], {"attr": pin["attr"]}), bin=pin["bin"])
-        if not p.get("bins"):
-            p["gui"] = bool(p.get("icon"))  # no file info (unfree, not on Hydra): guess
+        found = pinned_app(ident, cat, load_config())
+        if found is None:
+            return 1
+        p, sb = found
         record(key)
-        return run_package(p, pin["bin"], frontend)
+        if frontend == "tty":
+            return execute(p, p["bin"], [], sb)
+        if p.get("gui", True):
+            detach([SELF, "exec", ident])
+        else:
+            detach([TERMINAL, "-e", SELF, "exec", ident, "--shell"])
+        return 0
     p = cat.get(ident) or live_package(ident)
     if p is None:
         return 1
@@ -785,42 +1042,46 @@ def open_entry(key, cat, frontend):
 
 
 def run_package(p, binary, frontend):
+    """An uninstalled package, already confirmed."""
     if frontend == "tty":
-        os.execvpe("nix", nix_shell_argv(p, [binary]), nix_env(p))
+        return execute(p, binary, [], adhoc_sandbox(load_config(), p["attr"]))
     if p.get("gui", True):
         detach([SELF, "_spawn", p["attr"], binary])
     else:
-        # A CLI tool from the GUI: open a terminal with it on PATH.
-        detach([TERMINAL, "-e", *nix_shell_argv(p, [os.environ.get("SHELL", "zsh")])], nix_env(p))
+        # A CLI tool from the GUI: a terminal with a shell that has it on PATH.
+        detach([TERMINAL, "-e", SELF, "_spawn", p["attr"], binary, "--shell"])
     return 0
 
 
 def cmd_spawn(argv):
-    """Internal: fetch (with a notification) then exec a GUI package."""
-    attr, binary = argv[0], argv[1]
+    """Internal: run an already-confirmed uninstalled package (detached from
+    rofi, or in a terminal with --shell) in the default sandbox."""
+    shell = "--shell" in argv
+    attr, binary = [a for a in argv if a != "--shell"][:2]
     cat, _ = load_catalog(background_refresh=False)
     p = cat.get(attr) or {"attr": attr}
-    icon = p.get("icon") or "system-software-install"
-    if not in_store(p):
-        notify(f"Fetching {p.get('pname', attr)}", f"{NIXPKGS}#{attr}, this can take a minute", icon)
-    build = ["nix", "build", "--no-link", "--print-out-paths"]
-    build += ["--impure"] if not p.get("free", True) else []
-    r = subprocess.run(build + [f"{NIXPKGS}#{attr}"], env=nix_env(p), capture_output=True, text=True, check=False)
-    if r.returncode != 0:
-        notify(f"Couldn't start {p.get('pname', attr)}", r.stderr.strip()[-400:], "dialog-error", "critical")
-        return 1
-    # Same environment `nix shell` would give, without evaluating nixpkgs twice.
-    bindirs = [f"{o}/bin" for o in r.stdout.split() if os.path.isdir(f"{o}/bin")]
-    exe = next((f"{d}/{binary}" for d in bindirs if os.access(f"{d}/{binary}", os.X_OK)), None)
-    if exe is None:
-        notify(f"Couldn't start {p.get('pname', attr)}", f"{NIXPKGS}#{attr} has no bin/{binary}", "dialog-error", "critical")
-        return 1
-    env = dict(os.environ, PATH=":".join(bindirs + [os.environ.get("PATH", "")]))
-    # TUI apps (bottom, btop, ...) ship a Terminal=true desktop file.
-    desktop_files = [parse_desktop(f) or {} for o in r.stdout.split() for f in glob.glob(f"{o}/share/applications/*.desktop")]
-    if any(e.get("Terminal") == "true" for e in desktop_files):
-        os.execvpe(TERMINAL, [TERMINAL, "-e", exe], env)
-    os.execve(exe, [binary], env)
+    return execute(p, binary, [], adhoc_sandbox(load_config(), attr), shell)
+
+
+def cmd_exec(argv):
+    """`launch exec NAME [--shell] [--] ARGS...`: run a pinned app. This is
+    what the per-app commands on PATH call; listing the app is the approval,
+    so there's no prompt."""
+    if not argv:
+        sys.exit("usage: launch exec NAME [--shell] [--] [ARGS...]")
+    name, rest = argv[0], argv[1:]
+    shell = bool(rest) and rest[0] == "--shell"
+    if shell:
+        rest = rest[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    cat, _ = load_catalog(background_refresh=False)
+    found = pinned_app(name, cat, load_config())
+    if found is None:
+        sys.exit(f"launch: no app named {name!r} (see programs.launch.apps)")
+    p, sb = found
+    record(f"p:{name}")
+    return execute(p, p["bin"], rest, sb, shell)
 
 
 def cmd_pick():
@@ -901,7 +1162,8 @@ def rofi_list(out, cat, have, message=None):
 
 def rofi_confirm(out, cands, cmd=None):
     p = cands[0]
-    info = card(p)
+    sb = adhoc_sandbox(load_config(), p["attr"])
+    info = card(p, sb)
     m = [f"<span size='large' weight='bold' color='{P["accent"]}'>{esc(info['title'])}</span>"
          f"  <span color='{P["overlay1"]}'>{esc(info['version'])}</span>",
          f"<span color='{P["text"]}'>{esc(info['desc'])}</span>"]
@@ -918,7 +1180,7 @@ def rofi_confirm(out, cands, cmd=None):
     binary = cmd if cmd and cmd in p.get("bins", ()) else p["bin"]
     how = "" if p.get("gui") else " in a terminal"
     out.append(rofi_row(f"run {binary}", f"<b>󰐊  Run {esc(binary)}</b><span color='{P["subtext0"]}'>{how}</span>"
-                        f"\n<span size='small' color='{P["overlay1"]}'>nix shell {esc(NIXPKGS)}#{esc(p['attr'])}, nothing gets installed</span>",
+                        f"\n<span size='small' color='{P["overlay1"]}'>{esc(NIXPKGS)}#{esc(p['attr'])} in {esc(sb['backend'])}, nothing gets installed</span>",
                         f"r:{p['attr']}:{binary}"))
     for other in [b for b in p.get("bins", []) if b != binary][:6]:
         out.append(rofi_row(f"run {other}", f"󰐊  Run {esc(other)} instead\n<span size='small' color='{P["overlay1"]}'>"
@@ -997,6 +1259,8 @@ def main():
     if sub == "refresh":
         refresh(force="--force" in rest, quiet="--quiet" in rest, wait="--no-wait" not in rest)
         return 0
+    if sub == "exec":
+        return cmd_exec(rest)
     if sub == "_spawn":
         return cmd_spawn(rest)
     if sub in ("-h", "--help", "help"):

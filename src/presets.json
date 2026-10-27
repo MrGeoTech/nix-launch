@@ -1,0 +1,32 @@
+{
+  "backends": {
+    "none": { "type": "none" },
+    "bwrap": { "type": "bwrap" },
+    "microvm": { "type": "microvm" },
+    "default": { "type": "bwrap" }
+  },
+  "profiles": {
+    "isolated": {
+      "network": "none", "home": "none", "args": "none", "cwd": "none"
+    },
+    "shell": {
+      "network": "none", "home": "private", "args": "rw", "cwd": "rw"
+    },
+    "net": {
+      "inherits": ["shell"], "network": "full"
+    },
+    "gui": {
+      "inherits": ["shell"],
+      "wayland": true, "x11": true, "audio": true, "gpu": true, "theming": true
+    },
+    "gui-net": {
+      "inherits": ["gui", "net"]
+    },
+    "full": {
+      "inherits": ["gui-net"], "home": "full", "dbus": true
+    },
+    "default": {
+      "inherits": ["gui-net"]
+    }
+  }
+}

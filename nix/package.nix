@@ -6,6 +6,7 @@
   nix-index,
   fzf,
   libnotify,
+  bubblewrap,
   # Defaults baked into the wrapper (all still overridable from the
   # environment). The home-manager module fills these from its options.
   settings ? {},
@@ -39,11 +40,13 @@ in
       runHook preInstall
       install -Dm755 launch.py $out/bin/launch
       install -Dm644 meta.nix $out/share/nix-launch/meta.nix
+      install -Dm644 presets.json $out/share/nix-launch/presets.json
       patchShebangs $out/bin/launch
       wrapProgram $out/bin/launch \
         --set LAUNCH_META_NIX $out/share/nix-launch/meta.nix \
+        --set LAUNCH_PRESETS $out/share/nix-launch/presets.json \
         ${lib.concatStringsSep " " (lib.mapAttrsToList (k: v: "--set-default ${k} ${lib.escapeShellArg v}") envVars)} \
-        --prefix PATH : ${lib.makeBinPath [nix-index fzf libnotify]}
+        --prefix PATH : ${lib.makeBinPath [nix-index fzf libnotify bubblewrap]}
       runHook postInstall
     '';
 
