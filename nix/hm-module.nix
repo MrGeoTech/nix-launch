@@ -102,13 +102,14 @@ self: {
         description = ''
           `none`: run directly (only fetched on demand, no isolation).
           `bwrap`: bubblewrap namespaces, near-zero overhead.
-          `microvm`: a throwaway VM (not implemented yet; refuses to run).
+          `microvm`: a throwaway KVM virtual machine with its own kernel
+          (~1.5s to start; command-line apps only for now).
         '';
       };
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [];
-        description = "Extra arguments for the sandbox tool (bwrap only for now).";
+        description = "Extra arguments for bwrap, or for qemu with `microvm`.";
       };
       memory = mkOption {
         type = types.int;
@@ -192,11 +193,27 @@ self: {
       inherit (p) inherits network home args cwd wayland x11 audio gpu dbus theming paths env devices;
     };
 
-  configJson = {
-    backends = lib.mapAttrs (_: b: {inherit (b) type extraArgs memory vcpus;}) cfg.backends;
-    profiles = lib.mapAttrs (_: profileJson) cfg.profiles;
-    apps = lib.mapAttrs appJson cfg.apps;
-  };
+  # The VM bits are only pulled in when something can actually run in one:
+  # an app on a microvm backend, or the default backend (which uninstalled
+  # packages use) being one.
+  isVm = name: (cfg.backends.${name}.type or null) == "microvm";
+  usesVm = isVm "default" || lib.any (a: isVm a.backend) (lib.attrValues cfg.apps);
+  guest = pkgs.callPackage ./microvm-guest.nix {};
+
+  configJson =
+    {
+      backends = lib.mapAttrs (_: b: {inherit (b) type extraArgs memory vcpus;}) cfg.backends;
+      profiles = lib.mapAttrs (_: profileJson) cfg.profiles;
+      apps = lib.mapAttrs appJson cfg.apps;
+    }
+    // lib.optionalAttrs usesVm {
+      vm = {
+        kernel = "${guest}/kernel";
+        initrd = "${guest}/initrd";
+        qemu = "${pkgs.qemu_kvm}/bin/qemu-system-x86_64";
+        virtiofsd = lib.getExe pkgs.virtiofsd;
+      };
+    };
 
   # One command per app; `launch exec` does the fetching and sandboxing.
   wrapper = name: _:
@@ -367,6 +384,10 @@ in {
       known = set: name: builtins.hasAttr name set;
     in
       lib.flatten [
+        {
+          assertion = !usesVm || pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+          message = "programs.launch: the microvm backend only supports x86_64-linux so far.";
+        }
         (lib.mapAttrsToList (n: a: [
             {
               assertion = known cfg.backends a.backend;
@@ -387,8 +408,6 @@ in {
         cfg.profiles)
       ];
 
-    warnings = lib.optional (lib.any (a: (cfg.backends.${a.backend}.type or null) == "microvm") (lib.attrValues cfg.apps))
-      "programs.launch: the microvm backend isn't implemented yet; apps using it will refuse to start.";
 
     home.packages = [launch] ++ lib.mapAttrsToList wrapper cfg.apps;
 

@@ -26,6 +26,11 @@ Front ends, same logic underneath:
 """
 
 import fcntl
+import signal
+import socket
+import struct
+import termios
+import threading
 import glob
 import html
 import json
@@ -585,7 +590,9 @@ def card(p, sb=None):
         facts.append(("sandbox", describe_sandbox(sb)))
     warn = []
     if sb and sb["type"] == "microvm":
-        warn.append("the microvm backend isn't implemented yet, this won't start")
+        missing = [k for k in VM_UNSUPPORTED if sb["access"][k]]
+        if missing:
+            warn.append(f"microvm can't pass through {', '.join(missing)} yet (command-line apps only)")
     if p.get("broken"):
         warn.append("marked broken in nixpkgs, it may not build")
     if not p.get("free", True):
@@ -627,6 +634,7 @@ def load_config():
     pre, user = read_json(PRESETS, {}), read_json(CONFIG, {})
     cfg = {k: {**pre.get(k, {}), **user.get(k, {})} for k in ("backends", "profiles")}
     cfg["apps"] = user.get("apps", {})
+    cfg["vm"] = user.get("vm", {})  # guest image + qemu/virtiofsd, when microvm is used
     return cfg
 
 
@@ -665,7 +673,12 @@ def sandbox_for(cfg, backend="default", profile="default", extra=None, home_name
     sparse = merge_access(profile_layers(cfg, profile), extra or {})
     return {"backend": backend, "type": b["type"], "cfg": b, "profile": profile,
             "access": merge_access(json.loads(json.dumps(ACCESS_BASE)), sparse),
-            "home_name": re.sub(r"[^A-Za-z0-9._-]", "_", home_name)}
+            "home_name": re.sub(r"[^A-Za-z0-9._-]", "_", home_name),
+            "vm": cfg.get("vm") or {}}
+
+
+# What the microvm backend can't pass through yet.
+VM_UNSUPPORTED = ("wayland", "x11", "audio", "gpu", "dbus", "theming")
 
 
 def adhoc_sandbox(cfg, attr):
@@ -785,6 +798,202 @@ def bwrap_argv(sb, exe, argv0, args):
     return out + ["--argv0", argv0, "--", exe, *args]
 
 
+def relay(sock_path, proc, fd, inbound):
+    """Copy between one of our fds and a VM stdio port (qemu's listening
+    socket). Closing the stdin connection is how the app sees EOF; the
+    output ones end when qemu exits."""
+    s = socket.socket(socket.AF_UNIX)
+    for _ in range(250):
+        try:
+            s.connect(sock_path)
+            break
+        except OSError:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.02)
+    else:
+        return
+    try:
+        if inbound:
+            while chunk := os.read(fd, 65536):
+                s.sendall(chunk)
+            # qemu drops whatever it hasn't read yet when we hang up, and it
+            # only reads once the app has the port open -- so wait until
+            # it has taken everything.
+            while proc.poll() is None:
+                pending = struct.unpack("i", fcntl.ioctl(s, termios.TIOCOUTQ, b"\0" * 4))[0]
+                if pending == 0:
+                    break
+                time.sleep(0.01)
+        else:
+            while chunk := s.recv(65536):
+                os.write(fd, chunk)
+    except OSError:
+        pass
+    s.close()
+
+
+def microvm_run(sb, exe, args, bindirs, fail):
+    """Boot the shared guest image (nix/microvm-guest.nix) with this run's
+    mounts and command, wait for it, and return the app's exit status.
+    Every share is its own virtiofsd; the host store goes in read-only."""
+    a, vm, tty = sb["access"], sb["vm"], sys.stdin.isatty()
+    run = tempfile.mkdtemp(prefix="launch-vm-", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+    meta = os.path.join(run, "launch")  # env.sh in, status out
+    os.mkdir(meta)
+    cwd = os.getcwd()
+
+    mounts = []  # (host dir, guest path, mode)
+    if a["home"] == "full":
+        mounts.append((HOME, HOME, "rw"))
+    elif a["home"] == "private":
+        home = os.path.join(HOMES_DIR, sb["home_name"])
+        os.makedirs(home, exist_ok=True)
+        mounts.append((home, HOME, "rw"))
+    for path, mode in a["paths"].items():
+        path = os.path.expanduser(path)
+        if os.path.isdir(path):
+            mounts.append((path, path, mode))
+    shared_cwd = a["cwd"] != "none" and cwd not in (HOME, "/")
+    if shared_cwd:
+        mounts.append((cwd, cwd, a["cwd"]))
+    if a["args"] != "none":
+        # virtiofs shares directories, so an opened file brings its
+        # directory along (read-only for "ro") -- never all of $HOME or /.
+        for arg in args:
+            path = os.path.abspath(arg)
+            if arg.startswith("-") or not os.path.exists(path):
+                continue
+            d = path if os.path.isdir(path) else os.path.dirname(path)
+            if d not in (HOME, "/"):
+                mounts.append((d, d, a["args"]))
+    seen, uniq = set(), []
+    for m in sorted(mounts, key=lambda m: (m[1].count("/"), m[1])):  # parents first
+        if m[1] not in seen:
+            seen.add(m[1])
+            uniq.append(m)
+
+    # Host PATH entries that resolve into the store are visible in the guest.
+    path = bindirs + [r for r in (os.path.realpath(d) for d in os.environ.get("PATH", "").split(":") if d)
+                      if r.startswith("/nix/store/")] + ["/bin"]
+    env = {"HOME": HOME, "USER": USER, "PATH": ":".join(dict.fromkeys(path))}
+    for k in ("TERM", "COLORTERM", "LANG", "LANGUAGE", "LOCALE_ARCHIVE", "TZ", "TZDIR"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    env.update({k: v for k, v in os.environ.items() if k.startswith("LC_")})
+    certs = os.path.realpath("/etc/ssl/certs/ca-certificates.crt")
+    if certs.startswith("/nix/store/"):
+        env["SSL_CERT_FILE"] = env["NIX_SSL_CERT_FILE"] = certs
+    terminfo = [os.path.realpath(d) for d in (f"{HOME}/.nix-profile/share/terminfo",
+                "/run/current-system/sw/share/terminfo", f"/etc/profiles/per-user/{USER}/share/terminfo")]
+    env["TERMINFO_DIRS"] = ":".join(d for d in terminfo if d.startswith("/nix/store/"))
+    env.update(a["env"])
+
+    q = shlex.quote
+    lines = [f"LAUNCH_USER={q(USER)} LAUNCH_UID={os.getuid()} LAUNCH_GID={os.getgid()}",
+             f"LAUNCH_NET={1 if a['network'] == 'full' else 0}",
+             f"LAUNCH_CWD={q(cwd if shared_cwd else HOME)}"]
+    if tty:
+        size = shutil.get_terminal_size()
+        lines.append(f"LAUNCH_ROWS={size.lines} LAUNCH_COLS={size.columns}")
+    lines += [f"export {k}={q(v)}" for k, v in env.items()]
+    if a["home"] == "none":
+        lines.append(f"scratch {q(HOME)}")
+    tags = [("launch", meta, "rw"), ("store", "/nix/store", "ro")]
+    for i, (src, dst, mode) in enumerate(uniq):
+        tags.append((f"m{i}", src, mode))
+        lines.append(f"share m{i} {q(dst)}")
+    lines.append("set -- " + " ".join(q(x) for x in [exe, *args]))
+    with open(os.path.join(meta, "env.sh"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    log = open(os.path.join(run, "log"), "w")
+    daemons = []
+    # Being killed (closed terminal, timeout) must still tear the VM down.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
+    debug = bool(os.environ.get("LAUNCH_VM_DEBUG"))
+    try:
+        for tag, src, mode in tags:
+            sock = os.path.join(run, f"{tag}.sock")
+            daemons.append(subprocess.Popen(
+                [vm["virtiofsd"], f"--socket-path={sock}", f"--shared-dir={src}", "--sandbox=none",
+                 "--cache=auto", "--log-level=error"] + (["--readonly"] if mode == "ro" else []),
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log))
+        for _ in range(100):
+            if all(os.path.exists(os.path.join(run, f"{t}.sock")) for t, _, _ in tags):
+                break
+            time.sleep(0.02)
+        else:
+            return fail("virtiofsd didn't start:\n" + open(log.name).read()[-400:])
+
+        mem = int(sb["cfg"].get("memory", 2048))
+        # No serial port unless debugging: probing it costs ~0.3s of boot.
+        machine = "microvm,accel=kvm,acpi=off,rtc=on,memory-backend=mem" + ("" if debug else ",isa-serial=off")
+        qemu = [vm["qemu"], "-M", machine, "-cpu", "host",
+                "-m", f"{mem}M", "-smp", str(sb["cfg"].get("vcpus", 2)),
+                "-object", f"memory-backend-memfd,id=mem,size={mem}M,share=on",
+                "-nodefaults", "-no-user-config", "-no-reboot", "-display", "none",
+                "-kernel", vm["kernel"], "-initrd", vm["initrd"],
+                "-append", "panic=-1 reboot=t tsc=reliable no_timer_check"
+                + (" console=ttyS0 8250.nr_uarts=1 launch.debug" if debug else " quiet loglevel=0 8250.nr_uarts=0") + (" launch.tty" if tty else "")]
+        # The app's console is our stdio either way, so it works in a
+        # terminal, in a pipe, and (to /dev/null) from rofi.
+        qemu += ["-device", "virtio-serial-device"]
+        if debug:
+            qemu += ["-serial", f"file:{run}/kernel.log"]
+        streams = []  # (socket, our fd, inbound)
+        if tty:
+            qemu += ["-chardev", "stdio,id=io,signal=off", "-device", "virtconsole,chardev=io"]
+        else:
+            # Relayed through sockets: qemu's file chardev would truncate
+            # files we're redirected to, and its stdio chardev stops output
+            # once stdin hits EOF.
+            for name, fd, inbound in (("in", 0, True), ("out", 1, False), ("err", 2, False)):
+                sock = os.path.join(run, f"std{name}.sock")
+                qemu += ["-chardev", f"socket,id={name},path={sock},server=on,wait=off",
+                         "-device", f"virtserialport,chardev={name},name=launch.{name}"]
+                streams.append((sock, fd, inbound))
+        for i, (tag, _, _) in enumerate(tags):
+            qemu += ["-chardev", f"socket,id=fs{i},path={run}/{tag}.sock",
+                     "-device", f"vhost-user-fs-device,chardev=fs{i},tag={tag}"]
+        if a["network"] == "full":
+            qemu += ["-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0"]
+        qemu += sb["cfg"].get("extraArgs", [])
+        proc = subprocess.Popen(qemu, stdin=None if tty else subprocess.DEVNULL, stderr=log)
+        threads = [threading.Thread(target=relay, args=(sock, proc, fd, inbound), daemon=True)
+                   for sock, fd, inbound in streams]
+        for t in threads:
+            t.start()
+        r = proc
+        proc.wait()
+        for t, (_, _, inbound) in zip(threads, streams):
+            if not inbound:
+                t.join(timeout=2)  # drain what the app wrote last
+        if debug and os.path.exists(f"{run}/kernel.log"):
+            sys.stderr.write(open(f"{run}/kernel.log", errors="replace").read())
+        try:
+            status = int(open(os.path.join(meta, "status")).read().strip())
+        except (OSError, ValueError):
+            log.flush()
+            return fail(f"the VM stopped without finishing (qemu exit {r.returncode}); "
+                        "LAUNCH_VM_DEBUG=1 shows the guest's boot log:\n" + open(log.name).read()[-600:])
+        return status
+    finally:
+        for d in daemons:
+            d.terminate()
+        for d in daemons:
+            try:
+                d.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                d.kill()
+        log.close()
+        if debug:
+            print(f"launch: kept {run}", file=sys.stderr)
+        else:
+            shutil.rmtree(run, ignore_errors=True)
+
+
 def execute(p, binary, args, sb, shell=False):
     """Fetch p (if needed) and exec `binary args` -- or $SHELL with the
     package on PATH -- inside sandbox sb. Never returns on success.
@@ -794,14 +1003,13 @@ def execute(p, binary, args, sb, shell=False):
     name = p.get("pname", p["attr"])
 
     def fail(msg):
-        if tty:
-            print(f"launch: {msg}", file=sys.stderr)
-        else:
+        print(f"launch: {msg}", file=sys.stderr)
+        if not tty:
             notify(f"Couldn't start {name}", msg, "dialog-error", "critical")
         return 1
 
-    if sb["type"] == "microvm":
-        return fail("the microvm backend isn't implemented yet")
+    if sb["type"] == "microvm" and not all(sb["vm"].get(k) for k in ("kernel", "initrd", "qemu", "virtiofsd")):
+        return fail("the microvm backend isn't set up (programs.launch provides it when an app uses it)")
     if sb["type"] == "bwrap" and not shutil.which("bwrap"):
         return fail("bwrap (bubblewrap) isn't on PATH")
 
@@ -826,6 +1034,8 @@ def execute(p, binary, args, sb, shell=False):
             return fail(f"{NIXPKGS}#{p['attr']} has no bin/{binary}")
         argv0 = binary
 
+    if sb["type"] == "microvm":
+        return microvm_run(sb, exe, args, bindirs, fail)
     if sb["type"] == "none":
         argv, exe_path = [argv0, *args], exe
     else:
