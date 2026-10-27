@@ -1,0 +1,22 @@
+/* Catppuccin Mocha. */
+* {
+    base:       #1e1e2e;
+    mantle:     #181825;
+    crust:      #11111b;
+    surface0:   #313244;
+    surface1:   #45475a;
+    overlay0:   #6c7086;
+    overlay1:   #7f849c;
+    subtext0:   #a6adc8;
+    subtext1:   #bac2de;
+    text:       #cdd6f4;
+    mauve:      #cba6f7;
+    red:        #f38ba8;
+
+    /* Translucent layers. Hyprland blurs what's behind the window
+       (see ../hyprland), which gives the glass look. */
+    glass:      #1e1e2ee0;
+    well:       #11111b80;
+    edge:       #cba6f740;
+    pick:       #cba6f726;
+}
