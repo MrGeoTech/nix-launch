@@ -12,6 +12,8 @@
   in {
     packages = forAllSystems (pkgs: {
       default = pkgs.callPackage ./nix/package.nix {};
+      # Boot image for the microvm backend (only built if something uses it).
+      microvm-guest = pkgs.callPackage ./nix/microvm-guest.nix {};
     });
 
     overlays.default = final: _prev: {
